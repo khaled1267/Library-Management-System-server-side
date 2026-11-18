@@ -35,7 +35,7 @@ app.use((req, res, next) => {
 });
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 40 }));
 const fail = (res, status, message) => res.status(status).json({ message });
-const safeUser = (u) => ({ _id: u._id, userId: u.userId, name: u.name, email: u.email, role: u.role, phone: u.phone, department: u.department, studentNumber: u.studentNumber, createdAt: u.createdAt });
+const safeUser = (u) => ({ _id: u._id, userId: u.userId, name: u.name, email: u.email, role: u.role, phone: u.phone, department: u.department, semester: u.semester, studentNumber: u.studentNumber, createdAt: u.createdAt });
 const tokenFor = (u) => jwt.sign({ sub: u._id.toString(), role: u.role }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d', algorithm: 'HS256' });
 const sessionCookieName = 'library_session';
 const sessionCookieOptions = () => {
@@ -66,6 +66,7 @@ const cleanString = (v) => typeof v === 'string' ? v.trim() : v;
 const isEmail = (value) => typeof value === 'string' && value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(value);
 const isPassword = (value) => typeof value === 'string' && value.length >= 8 && Buffer.byteLength(value, 'utf8') <= 72;
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+export const bookAvailabilityStatus = (totalCopies, availableCopies) => availableCopies > 0 ? 'Available' : totalCopies > 0 ? 'Busy' : 'Unavailable';
 const logError = (label, error, details = {}) => console.error(label, {
   ...details,
   errorName: error?.name || 'Error',
@@ -87,15 +88,15 @@ export async function initializeAdminAccount() {
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok', database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 app.post('/api/auth/register', wrap(async (req, res) => {
-  const { name, email, password, phone = '', department = '', studentNumber = '' } = req.body;
+  const { name, email, password, phone = '', department = '', semester = '', studentNumber = '' } = req.body;
   if (typeof name !== 'string' || !name.trim() || name.trim().length > 100 || !isEmail(email) || !isPassword(password)) return fail(res, 400, 'Enter a name, a valid email, and a password of 8 to 72 UTF-8 bytes.');
-  if ([phone, department, studentNumber].some(value => typeof value !== 'string' || value.length > 120)) return fail(res, 400, 'Optional profile fields must be text no longer than 120 characters.');
+  if ([phone, department, studentNumber].some(value => typeof value !== 'string' || value.length > 120) || typeof semester !== 'string' || semester.length > 50) return fail(res, 400, 'Optional profile fields are invalid or too long.');
   const normalizedEmail = email.trim().toLowerCase();
   if (await User.exists({ email: normalizedEmail })) return fail(res, 409, 'An account with this email already exists.');
   const userId = `LIB-${new Date().getFullYear()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
   let user;
   try {
-    user = await User.create({ name: name.trim(), email: normalizedEmail, password, phone, department, studentNumber, userId, role: 'student' });
+    user = await User.create({ name: name.trim(), email: normalizedEmail, password, phone, department, semester, studentNumber, userId, role: 'student' });
   } catch (error) {
     logError('[registration] save failed', error);
     throw error;
@@ -142,14 +143,82 @@ app.post('/api/auth/reset-password', wrap(async (req, res) => {
   if (!u) return fail(res, 400, 'This recovery link is invalid or expired.'); u.password = password; u.resetTokenHash = undefined; u.resetTokenExpires = undefined; await u.save(); res.json({ message: 'Password updated. You can now sign in.' });
 }));
 app.get('/api/auth/me', auth, (req, res) => { if (req.sessionToken) res.cookie(sessionCookieName, req.sessionToken, sessionCookieOptions()); res.json({ user: safeUser(req.user) }); });
-app.patch('/api/users/me', auth, wrap(async (req, res) => { const fields = ['name', 'phone', 'department', 'studentNumber']; fields.forEach(k => { if (req.body[k] !== undefined) req.user[k] = cleanString(req.body[k]); }); await req.user.save(); res.json({ user: safeUser(req.user) }); }));
+app.patch('/api/users/me', auth, wrap(async (req, res) => {
+  const fields = ['name', 'phone', 'department', 'semester', 'studentNumber'];
+  if (fields.some(field => req.body[field] !== undefined && typeof req.body[field] !== 'string')) return fail(res, 400, 'Profile fields must be text.');
+  if (typeof req.body.name === 'string' && (!req.body.name.trim() || req.body.name.trim().length > 100)) return fail(res, 400, 'Name must be 1 to 100 characters.');
+  if (typeof req.body.semester === 'string' && req.body.semester.length > 50) return fail(res, 400, 'Semester must be 50 characters or fewer.');
+  if (['phone', 'department', 'studentNumber'].some(field => typeof req.body[field] === 'string' && req.body[field].length > 120)) return fail(res, 400, 'Profile fields must be 120 characters or fewer.');
+  fields.forEach(field => { if (req.body[field] !== undefined) req.user[field] = cleanString(req.body[field]); });
+  await req.user.save(); res.json({ user: safeUser(req.user) });
+}));
 app.patch('/api/users/me/password', auth, wrap(async (req, res) => { const u = await User.findById(req.user._id).select('+password'); if (typeof req.body.currentPassword !== 'string' || Buffer.byteLength(req.body.currentPassword, 'utf8') > 72 || !(await u.comparePassword(req.body.currentPassword))) return fail(res, 400, 'Current password is incorrect.'); if (!isPassword(req.body.newPassword)) return fail(res, 400, 'New password must be 8 to 72 UTF-8 bytes.'); u.password = req.body.newPassword; await u.save(); res.json({ message: 'Password updated.' }); }));
 
 app.get('/api/books', wrap(async (req, res) => {
   if (req.query.search !== undefined && (typeof req.query.search !== 'string' || req.query.search.length > 120)) return fail(res, 400, 'Search text must be 120 characters or fewer.');
-  const filter = {}; if (req.query.search) { const query = escapeRegex(req.query.search); filter.$or = ['title', 'isbn', 'description'].map(k => ({ [k]: { $regex: query, $options: 'i' } })); }
-  if (req.query.category) filter.category = req.query.category; if (req.query.available === 'true') filter.availableCopies = { $gt: 0 };
-  const books = await Book.find(filter).populate('author', 'name').populate('category', 'name').sort({ createdAt: -1 }); res.json({ books });
+  if (req.query.available !== undefined && !['true', 'false'].includes(req.query.available)) return fail(res, 400, 'Availability filter must be true or false.');
+  if (req.query.category !== undefined && (typeof req.query.category !== 'string' || !mongoose.isObjectIdOrHexString(req.query.category))) return fail(res, 400, 'Choose a valid category.');
+  if (req.query.author !== undefined && (typeof req.query.author !== 'string' || !mongoose.isObjectIdOrHexString(req.query.author))) return fail(res, 400, 'Choose a valid author.');
+  const page = req.query.page === undefined ? 1 : Number(req.query.page);
+  const limit = req.query.limit === undefined ? 24 : Number(req.query.limit);
+  if (!Number.isInteger(page) || page < 1 || !Number.isInteger(limit) || limit < 1 || limit > 100) return fail(res, 400, 'Page must be positive and page size must be between 1 and 100.');
+  const filter = {};
+  const searchTerm = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+  if (searchTerm) {
+    const query = escapeRegex(searchTerm);
+    const matchingAuthors = await Author.find({ name: { $regex: query, $options: 'i' } }).select('_id').lean();
+    filter.$or = [
+      { title: { $regex: query, $options: 'i' } },
+      { isbn: { $regex: query, $options: 'i' } },
+      { description: { $regex: query, $options: 'i' } },
+      ...(matchingAuthors.length ? [{ author: { $in: matchingAuthors.map(author => author._id) } }] : []),
+    ];
+  }
+  if (req.query.category) filter.category = req.query.category;
+  if (req.query.author) filter.author = req.query.author;
+  if (req.query.available === 'true') filter.availableCopies = { $gt: 0 };
+  if (req.query.available === 'false') filter.availableCopies = 0;
+  const total = await Book.countDocuments(filter);
+  const books = await Book.find(filter).populate('author', 'name').populate('category', 'name').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit);
+  const activeCounts = books.length ? await BookIssue.aggregate([
+    { $match: { status: 'issued', book: { $in: books.map(book => book._id) } } },
+    { $group: { _id: '$book', count: { $sum: 1 } } },
+  ]) : [];
+  const issuedByBook = new Map(activeCounts.map(item => [String(item._id), item.count]));
+  res.json({ books: books.map(book => ({
+    ...book.toObject(),
+    issuedCopies: issuedByBook.get(String(book._id)) || 0,
+    availabilityStatus: bookAvailabilityStatus(book.totalCopies, book.availableCopies),
+  })), pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } });
+}));
+app.get('/api/books/:id/availability', wrap(async (req, res) => {
+  if (!mongoose.isObjectIdOrHexString(req.params.id)) return fail(res, 400, 'Book ID is invalid.');
+  const book = await Book.findById(req.params.id).populate('author', 'name').populate('category', 'name');
+  if (!book) return res.status(404).json({ book: null, status: 'Unavailable', message: 'This title is not in the library catalog.' });
+  const issuedCopies = await BookIssue.countDocuments({ book: book._id, status: 'issued' });
+  res.json({ book: { ...book.toObject(), issuedCopies, availabilityStatus: bookAvailabilityStatus(book.totalCopies, book.availableCopies) } });
+}));
+app.get('/api/books/:id/borrowers', auth, admin, wrap(async (req, res) => {
+  if (!mongoose.isObjectIdOrHexString(req.params.id)) return fail(res, 400, 'Book ID is invalid.');
+  const exists = await Book.exists({ _id: req.params.id });
+  if (!exists) return fail(res, 404, 'Book not found.');
+  const issues = await BookIssue.find({ book: req.params.id, status: 'issued' })
+    .select('student issueDate dueDate')
+    .populate('student', 'name userId semester studentNumber department')
+    .sort({ issueDate: -1 })
+    .lean();
+  res.json({ borrowers: issues.filter(issue => issue.student).map(issue => ({
+    issueId: issue._id,
+    student: {
+      name: issue.student.name,
+      userId: issue.student.userId,
+      semester: issue.student.semester || '',
+      rollNumber: issue.student.studentNumber || '',
+      department: issue.student.department || '',
+    },
+    issueDate: issue.issueDate,
+    dueDate: issue.dueDate,
+  })) });
 }));
 app.get('/api/books/google-search', auth, admin, wrap(async (req, res) => {
   const query = cleanString(req.query.query || '');
@@ -235,19 +304,179 @@ app.get('/api/users', auth, admin, wrap(async (req, res) => {
 }));
 app.get('/api/users/:userId', auth, admin, wrap(async (req, res) => { const u = await User.findOne({ userId: req.params.userId.toUpperCase(), role: 'student' }); if (!u) return fail(res, 404, 'Student not found.'); const issues = await BookIssue.find({ student: u._id }).populate('book', 'title isbn').sort({ issueDate: -1 }); res.json({ user: safeUser(u), issues }); }));
 app.get('/api/issues', auth, wrap(async (req, res) => { const filter = req.user.role === 'admin' ? {} : { student: req.user._id }; if (req.query.status) filter.status = req.query.status; const issues = await BookIssue.find(filter).populate('book').populate('student', 'name userId email').populate('issuedBy', 'name').populate('returnedBy', 'name').sort({ issueDate: -1 }); res.json({ issues }); }));
-app.post('/api/issues', auth, admin, wrap(async (req, res) => {
-  const { bookId, userId, dueDate } = req.body; const [book, student] = await Promise.all([Book.findById(bookId), User.findOne({ userId: String(userId).toUpperCase(), role: 'student' })]);
-  if (!book) return fail(res, 404, 'Book not found.'); if (!student) return fail(res, 404, 'Student not found.');
-  const parsedDueDate = typeof dueDate === 'string' || dueDate instanceof Date ? new Date(dueDate) : new Date(Number.NaN);
+app.get('/api/return-requests', auth, admin, wrap(async (req, res) => {
+  const requestedStatus = req.query.status || 'pending';
+  if (typeof requestedStatus !== 'string' || !['pending', 'approved', 'rejected', 'all'].includes(requestedStatus)) return fail(res, 400, 'Choose a valid return request status.');
+  const filter = { returnRequestStatus: requestedStatus === 'all' ? { $in: ['pending', 'approved', 'rejected'] } : requestedStatus };
+  if (requestedStatus === 'pending') filter.status = 'issued';
+  const requests = await BookIssue.find(filter)
+    .populate('book', 'title coverUrl')
+    .populate('student', 'name userId department semester studentNumber')
+    .sort({ returnRequestDate: -1 });
+  res.json({ requests });
+}));
+app.post('/api/issues/:id/return-request', auth, wrap(async (req, res) => {
+  if (req.user.role !== 'student') return fail(res, 403, 'Only students can request returns.');
+  if (!mongoose.isObjectIdOrHexString(req.params.id)) return fail(res, 400, 'Issue ID is invalid.');
+  const issue = await BookIssue.findOneAndUpdate(
+    {
+      _id: req.params.id,
+      student: req.user._id,
+      status: 'issued',
+      $or: [
+        { returnRequestStatus: { $exists: false } },
+        { returnRequestStatus: 'none' },
+        { returnRequestStatus: 'rejected' },
+      ],
+    },
+    {
+      $set: { returnRequestStatus: 'pending', returnRequestDate: new Date(), returnRequestReason: '' },
+      $unset: { returnRequestReviewedAt: 1, returnRequestReviewedBy: 1 },
+    },
+    { new: true, runValidators: true },
+  );
+  if (!issue) {
+    const ownedIssue = await BookIssue.findOne({ _id: req.params.id, student: req.user._id });
+    if (!ownedIssue) return fail(res, 404, 'Active book issue not found.');
+    if (ownedIssue.status !== 'issued') return fail(res, 409, 'This book has already been returned.');
+    if (ownedIssue.returnRequestStatus === 'pending') return fail(res, 409, 'A return request is already pending for this book.');
+    return fail(res, 409, 'This book cannot be requested for return right now.');
+  }
+  res.status(201).json({ message: 'Return request submitted. Please hand the book to a librarian or administrator.', issue });
+}));
+app.post('/api/issues/:id/return-request/review', auth, admin, wrap(async (req, res) => {
+  if (!mongoose.isObjectIdOrHexString(req.params.id)) return fail(res, 400, 'Issue ID is invalid.');
+  const action = req.body.action;
+  if (!['approve', 'reject'].includes(action)) return fail(res, 400, 'Choose approve or reject for this return request.');
+  const reason = req.body.reason ?? '';
+  if (action === 'reject' && (typeof reason !== 'string' || reason.trim().length > 500)) return fail(res, 400, 'Rejection reason must be 500 characters or fewer.');
+  const requestFilter = { _id: req.params.id, status: 'issued', returnRequestStatus: 'pending' };
+  const reviewedAt = new Date();
+
+  if (action === 'reject') {
+    const issue = await BookIssue.findOneAndUpdate(requestFilter, {
+      $set: {
+        returnRequestStatus: 'rejected',
+        returnRequestReason: typeof reason === 'string' ? reason.trim() : '',
+        returnRequestReviewedAt: reviewedAt,
+        returnRequestReviewedBy: req.user._id,
+      },
+    }, { new: true, runValidators: true });
+    if (!issue) {
+      const exists = await BookIssue.exists({ _id: req.params.id });
+      return fail(res, exists ? 409 : 404, exists ? 'This issue is no longer awaiting a return decision.' : 'Book issue not found.');
+    }
+    return res.json({ message: 'Return request rejected.', issue: await issue.populate(['book', 'student']) });
+  }
+
+  let issue = null;
+  let session;
+  try {
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      issue = await BookIssue.findOneAndUpdate(requestFilter, {
+        $set: {
+          status: 'returned',
+          returnedAt: reviewedAt,
+          returnedBy: req.user._id,
+          returnNote: 'Student return request approved.',
+          returnRequestStatus: 'approved',
+          returnRequestReviewedAt: reviewedAt,
+          returnRequestReviewedBy: req.user._id,
+          returnRequestReason: '',
+        },
+      }, { new: true, session, runValidators: true });
+      if (!issue) return;
+      const stock = await Book.updateOne(
+        { _id: issue.book, $expr: { $lt: ['$availableCopies', '$totalCopies'] } },
+        { $inc: { availableCopies: 1 } },
+        { session },
+      );
+      if (!stock.modifiedCount) {
+        const stockConflict = new Error('Book stock cannot be incremented for this return.');
+        stockConflict.code = 'RETURN_STOCK_CONFLICT';
+        throw stockConflict;
+      }
+    });
+  } catch (error) {
+    if (error.code === 'RETURN_STOCK_CONFLICT') return fail(res, 409, error.message);
+    logError('[return-request] approval transaction failed', error, { issueId: req.params.id });
+    return fail(res, 503, 'Return approval could not be completed. No changes were committed; please retry.');
+  } finally {
+    await session?.endSession();
+  }
+  if (!issue) {
+    const exists = await BookIssue.exists({ _id: req.params.id });
+    return fail(res, exists ? 409 : 404, exists ? 'This issue is no longer awaiting a return decision.' : 'Book issue not found.');
+  }
+  res.json({ message: 'Return approved and book stock updated.', issue: await issue.populate(['book', 'student', 'returnedBy']) });
+}));
+app.post('/api/issues', auth, wrap(async (req, res) => {
+  const { bookId, userId, dueDate } = req.body;
+  if (req.body.selfService === true && req.user.role !== 'student') return fail(res, 403, 'Student borrowing is only available to student accounts.');
+  if (!mongoose.isObjectIdOrHexString(bookId)) return fail(res, 400, 'Choose a valid book.');
+  const isStudentBorrow = req.user.role === 'student';
+  if (!isStudentBorrow && req.user.role !== 'admin') return fail(res, 403, 'Only students can borrow books and administrators can issue books.');
+  const [book, student] = await Promise.all([
+    Book.findById(bookId),
+    isStudentBorrow ? User.findById(req.user._id) : User.findOne({ userId: typeof userId === 'string' ? userId.trim().toUpperCase() : '', role: 'student' }),
+  ]);
+  if (!book) return fail(res, 404, 'Book not found.'); if (!student) return fail(res, 404, isStudentBorrow ? 'Student account not found.' : 'Student not found.');
+  const parsedDueDate = isStudentBorrow
+    ? new Date(Date.now() + 14 * 24 * 60 * 60 * 1000)
+    : typeof dueDate === 'string' || dueDate instanceof Date ? new Date(dueDate) : new Date(Number.NaN);
   if (Number.isNaN(parsedDueDate.getTime()) || parsedDueDate <= new Date()) return fail(res, 400, 'Choose a valid return date in the future.');
   if (book.availableCopies < 1) return fail(res, 409, 'No available copies remain.');
   if (await BookIssue.exists({ book: book._id, student: student._id, status: 'issued' })) return fail(res, 409, 'This student already has an active issue for this book.');
   const stock = await Book.updateOne({ _id: book._id, availableCopies: { $gt: 0 } }, { $inc: { availableCopies: -1 } });
   if (!stock.modifiedCount) return fail(res, 409, 'No available copies remain.');
   try { const issue = await BookIssue.create({ book: book._id, student: student._id, issuedBy: req.user._id, dueDate: parsedDueDate }); res.status(201).json({ issue: await issue.populate(['book', 'student']) }); }
-  catch (error) { await Book.updateOne({ _id: book._id }, { $inc: { availableCopies: 1 } }); throw error; }
+  catch (error) {
+    await Book.updateOne({ _id: book._id }, { $inc: { availableCopies: 1 } });
+    if (error.code === 11000) return fail(res, 409, 'This student already has an active issue for this book.');
+    throw error;
+  }
 }));
-app.post('/api/issues/:id/return', auth, admin, wrap(async (req, res) => { const issue = await BookIssue.findOneAndUpdate({ _id: req.params.id, status: 'issued' }, { $set: { status: 'returned', returnedAt: new Date(), returnedBy: req.user._id, returnNote: cleanString(req.body.note || '') } }, { new: true }); if (!issue) { const exists = await BookIssue.exists({ _id: req.params.id }); return fail(res, exists ? 409 : 404, exists ? 'This book has already been returned.' : 'Issue not found.'); } const book = await Book.findById(issue.book); if (book) await Book.updateOne({ _id: book._id }, [{ $set: { availableCopies: { $min: ['$totalCopies', { $add: ['$availableCopies', 1] }] } } }]); res.json({ issue: await issue.populate(['book', 'student', 'returnedBy']) }); }));
+app.post('/api/issues/:id/return', auth, admin, wrap(async (req, res) => {
+  const issue = await BookIssue.findOneAndUpdate(
+    { _id: req.params.id, status: 'issued' },
+    { $set: { status: 'returned', returnedAt: new Date(), returnedBy: req.user._id, returnNote: cleanString(req.body.note || '') } },
+    { new: true },
+  );
+  if (!issue) {
+    const exists = await BookIssue.exists({ _id: req.params.id });
+    return fail(res, exists ? 409 : 404, exists ? 'This book has already been returned.' : 'Issue not found.');
+  }
+  const requestWasPending = issue.returnRequestStatus === 'pending';
+  try {
+    if (requestWasPending) {
+      const approvedRequest = await BookIssue.updateOne(
+        { _id: issue._id, status: 'returned', returnRequestStatus: 'pending', returnedAt: issue.returnedAt },
+        { $set: { returnRequestStatus: 'approved', returnRequestReviewedAt: issue.returnedAt, returnRequestReviewedBy: req.user._id } },
+      );
+      if (!approvedRequest.modifiedCount) throw new Error('The pending return request could not be closed.');
+    }
+    const book = await Book.findById(issue.book);
+    if (!book) throw new Error('The returned issue references a missing book.');
+    const stock = await Book.updateOne({ _id: book._id }, [{ $set: { availableCopies: { $min: ['$totalCopies', { $add: ['$availableCopies', 1] }] } } }]);
+    if (!stock.modifiedCount) throw new Error('Book stock could not be restored for this return.');
+  } catch (error) {
+    try {
+      const restored = await BookIssue.updateOne(
+        { _id: issue._id, status: 'returned', returnedBy: req.user._id, returnedAt: issue.returnedAt },
+        {
+          $set: { status: 'issued', returnNote: '', ...(requestWasPending ? { returnRequestStatus: 'pending' } : {}) },
+          $unset: { returnedAt: 1, returnedBy: 1, ...(requestWasPending ? { returnRequestReviewedAt: 1, returnRequestReviewedBy: 1 } : {}) },
+        },
+      );
+      if (!restored.modifiedCount) logError('[issue-return] unable to restore issue after stock update failure', error, { issueId: String(issue._id) });
+    } catch (restoreError) {
+      logError('[issue-return] issue restoration failed', restoreError, { issueId: String(issue._id) });
+    }
+    throw error;
+  }
+  res.json({ issue: await BookIssue.findById(issue._id).populate(['book', 'student', 'returnedBy']) });
+}));
 app.get('/api/dashboard', auth, wrap(async (req, res) => {
   if (req.user.role === 'admin') {
     const [bookTitles, totalCopies, availableCopies, students, issued, returned, recentIssues, recentStudents, byCategory] = await Promise.all([

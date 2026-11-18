@@ -9,6 +9,7 @@ const userSchema = new mongoose.Schema({
   role: { type: String, enum: ['admin', 'student'], default: 'student' },
   phone: { type: String, trim: true, default: '' },
   department: { type: String, trim: true, default: '' },
+  semester: { type: String, trim: true, default: '', maxlength: 50 },
   studentNumber: { type: String, trim: true, default: '' },
   resetTokenHash: { type: String, select: false },
   resetTokenExpires: { type: Date, select: false }
@@ -33,9 +34,14 @@ const issueSchema = new mongoose.Schema({
   issuedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   issueDate: { type: Date, default: Date.now }, dueDate: { type: Date, required: true },
   returnedAt: { type: Date, default: null }, returnedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
-  returnNote: { type: String, trim: true, default: '' }, status: { type: String, enum: ['issued', 'returned'], default: 'issued' }
+  returnNote: { type: String, trim: true, default: '' }, status: { type: String, enum: ['issued', 'returned'], default: 'issued' },
+  returnRequestStatus: { type: String, enum: ['none', 'pending', 'approved', 'rejected'], default: 'none' },
+  returnRequestDate: { type: Date, default: null }, returnRequestReviewedAt: { type: Date, default: null },
+  returnRequestReviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  returnRequestReason: { type: String, trim: true, maxlength: 500, default: '' }
 }, { timestamps: true });
 issueSchema.index({ book: 1, student: 1 }, { unique: true, partialFilterExpression: { status: 'issued' } });
+issueSchema.index({ status: 1, returnRequestStatus: 1, returnRequestDate: -1 });
 
 export const User = mongoose.model('User', userSchema);
 export const Category = mongoose.model('Category', categorySchema);

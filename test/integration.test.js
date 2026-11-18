@@ -20,7 +20,7 @@ if (!['localhost', '127.0.0.1', '[::1]'].includes(testDatabaseUrl.hostname) || !
   throw new Error('Refusing integration tests: TEST_MONGODB_URI must point to localhost and use a database name ending in _test.');
 }
 
-const [{ default: app, initializeAdminAccount }, { User, Book, Category, Author, BookIssue }] = await Promise.all([
+const [{ default: app, initializeAdminAccount, bookAvailabilityStatus }, { User, Book, Category, Author, BookIssue }] = await Promise.all([
   import('../src/server.js'),
   import('../src/models.js'),
 ]);
@@ -28,12 +28,21 @@ const [{ default: app, initializeAdminAccount }, { User, Book, Category, Author,
 test('Mongoose schemas declare required auth fields and linked records', () => {
   assert.equal(User.schema.path('password').options.select, false);
   assert.deepEqual(User.schema.path('role').enumValues, ['admin', 'student']);
+  assert.equal(User.schema.path('semester').options.default, '');
   assert.equal(Book.schema.path('author').options.ref, 'Author');
   assert.equal(Book.schema.path('category').options.ref, 'Category');
   assert.equal(Book.schema.path('publishedDate').instance, 'String');
   assert.equal(BookIssue.schema.path('book').options.ref, 'Book');
   assert.equal(BookIssue.schema.path('student').options.ref, 'User');
+  assert.deepEqual(BookIssue.schema.path('returnRequestStatus').enumValues, ['none', 'pending', 'approved', 'rejected']);
+  assert.equal(BookIssue.schema.path('returnRequestReason').options.maxlength, 500);
   assert.ok(BookIssue.schema.indexes().some(([keys, options]) => keys.book === 1 && keys.student === 1 && options.unique && options.partialFilterExpression?.status === 'issued'));
+});
+
+test('book availability status distinguishes available, busy, and unavailable inventory', () => {
+  assert.equal(bookAvailabilityStatus(4, 2), 'Available');
+  assert.equal(bookAvailabilityStatus(4, 0), 'Busy');
+  assert.equal(bookAvailabilityStatus(0, 0), 'Unavailable');
 });
 
 let server;
@@ -46,6 +55,8 @@ let secondStudent;
 let category;
 let author;
 let book;
+let availabilityBook;
+let selfServiceBook;
 let activeIssueId;
 let issuedStudent;
 
@@ -114,7 +125,7 @@ test('isolated MongoDB API integration workflows', async (t) => {
   await t.test('student registration generates unique IDs and blocks role injection', async () => {
     assert.equal((await call('/auth/register', { method: 'POST', body: { name: {}, email: 'not-an-email', password: 'StudentOne123!' } })).response.status, 400);
     assert.equal((await call('/auth/register', { method: 'POST', body: { name: 'Long Password', email: 'long@library-integration.test', password: 'a'.repeat(73) } })).response.status, 400);
-    const first = await call('/auth/register', { method: 'POST', body: { name: 'Test Student One', email: 'student1@library-integration.test', password: 'StudentOne123!', department: 'Science', role: 'admin' } });
+    const first = await call('/auth/register', { method: 'POST', body: { name: 'Test Student One', email: 'student1@library-integration.test', password: 'StudentOne123!', department: 'Science', semester: '3rd Semester', studentNumber: 'SCI-014', role: 'admin' } });
     assert.equal(first.response.status, 201);
     const registrationCookie = first.response.headers.get('set-cookie')?.split(';', 1)[0];
     assert.match(first.response.headers.get('set-cookie') || '', /httponly/i);
@@ -125,7 +136,7 @@ test('isolated MongoDB API integration workflows', async (t) => {
     const restoredRegistrationSession = await call('/auth/me', { headers: { Cookie: registrationCookie } });
     assert.equal(restoredRegistrationSession.response.status, 200);
     assert.equal(restoredRegistrationSession.data.user._id, student._id);
-    const second = await call('/auth/register', { method: 'POST', body: { name: 'Test Student Two', email: 'student2@library-integration.test', password: 'StudentTwo123!', role: 'admin' } });
+    const second = await call('/auth/register', { method: 'POST', body: { name: 'Test Student Two', email: 'student2@library-integration.test', password: 'StudentTwo123!', department: 'Arts', semester: '5th Semester', studentNumber: 'ART-022', role: 'admin' } });
     assert.equal(second.response.status, 201);
     assert.notEqual(second.data.user.userId, student.userId);
     secondStudent = second.data.user;
@@ -225,6 +236,12 @@ test('isolated MongoDB API integration workflows', async (t) => {
     assert.equal(result.response.status, 201);
     assert.equal((await Book.findById(result.data.book._id)).publishedDate, '2024-02');
     await Book.findByIdAndDelete(result.data.book._id);
+    result = await call('/books', { method: 'POST', token: adminToken, body: { title: 'Availability Test Book', isbn: 'TEST-AVAILABILITY-1', author: author._id, category: category._id, totalCopies: 2, availableCopies: 2 } });
+    assert.equal(result.response.status, 201);
+    availabilityBook = result.data.book;
+    result = await call('/books', { method: 'POST', token: adminToken, body: { title: 'Student Borrow Test Book', isbn: 'TEST-STUDENT-BORROW-1', author: author._id, category: category._id, totalCopies: 2, availableCopies: 2 } });
+    assert.equal(result.response.status, 201);
+    selfServiceBook = result.data.book;
     const storedBook = await Book.findById(book._id);
     assert.equal(String(storedBook.author), author._id);
     assert.equal(String(storedBook.category), category._id);
@@ -235,8 +252,30 @@ test('isolated MongoDB API integration workflows', async (t) => {
     assert.equal(result.data.books.length, 1);
     assert.equal(result.data.books[0].author.name, 'Integration Author');
     assert.equal(result.data.books[0].category.name, 'Integration Fiction');
+    assert.equal((await call('/books?search=Integration%20Author')).data.books.length, 2);
+    assert.equal((await call('/books?search=TEST-ISBN-1')).data.books.length, 1);
+    assert.equal((await call('/books?search=No%20Such%20Title')).data.books.length, 0);
+    assert.equal((await call(`/books?category=${category._id}`)).data.books.length, 2);
+    assert.equal((await call(`/books?author=${author._id}`)).data.books.length, 2);
+    const firstBookPage = await call(`/books?category=${category._id}&page=1&limit=1`);
+    const secondBookPage = await call(`/books?category=${category._id}&page=2&limit=1`);
+    assert.equal(firstBookPage.data.books.length, 1);
+    assert.deepEqual(firstBookPage.data.pagination, { page: 1, limit: 1, total: 2, totalPages: 2 });
+    assert.equal(secondBookPage.data.books.length, 1);
+    assert.notEqual(firstBookPage.data.books[0]._id, secondBookPage.data.books[0]._id);
     assert.equal((await call('/books?search=%2E%2A')).data.books.length, 0);
     assert.equal((await call(`/books?search=${'a'.repeat(121)}`)).response.status, 400);
+    assert.equal((await call('/books?category=invalid')).response.status, 400);
+    assert.equal((await call('/books?author=invalid')).response.status, 400);
+    assert.equal((await call('/books?limit=101')).response.status, 400);
+    assert.equal((await call('/books?available=maybe')).response.status, 400);
+    assert.equal((await call(`/books/${book._id}/availability`)).data.book.availabilityStatus, 'Available');
+    assert.equal((await call('/books/not-an-object-id/availability')).response.status, 400);
+    const missingBook = await call(`/books/${new mongoose.Types.ObjectId()}/availability`);
+    assert.equal(missingBook.response.status, 404);
+    assert.equal(missingBook.data.status, 'Unavailable');
+    assert.equal((await call(`/books/${availabilityBook._id}/borrowers`)).response.status, 401);
+    assert.equal((await call(`/books/${availabilityBook._id}/borrowers`, { token: (await login(student.userId, 'StudentOne123!')).data.token })).response.status, 403);
     result = await call(`/books/${book._id}`, { method: 'PATCH', token: adminToken, body: { title: 'Integration Book Revised' } });
     assert.equal(result.response.status, 200);
     assert.equal(result.data.book.title, 'Integration Book Revised');
@@ -256,7 +295,6 @@ test('isolated MongoDB API integration workflows', async (t) => {
     issuedStudent = winner.data.issue.student;
     assert.equal((await Book.findById(book._id)).availableCopies, 0);
     assert.equal(await BookIssue.countDocuments({ book: book._id, status: 'issued' }), 1);
-    assert.equal((await call('/issues', { method: 'POST', token: (await login(student.email, 'StudentOne123!')).data.token, body: { bookId: book._id, userId: student.userId, dueDate } })).response.status, 403);
     assert.equal((await call('/issues', { method: 'POST', token: adminToken, body: { bookId: book._id, userId: issuedStudent.userId, dueDate } })).response.status, 409);
 
     const owner = issuedStudent.userId === student.userId ? student : secondStudent;
@@ -268,36 +306,147 @@ test('isolated MongoDB API integration workflows', async (t) => {
     assert.equal(ownIssues.data.issues[0].student.userId, owner.userId);
     const otherToken = (await login(otherStudent.userId, otherStudent === student ? 'StudentOne123!' : 'StudentTwo123!')).data.token;
     assert.equal((await call('/issues', { token: otherToken })).data.issues.length, 0);
-    const returned = await call(`/issues/${activeIssueId}/return`, { method: 'POST', token: adminToken, body: { note: 'Integration return' } });
+    assert.equal((await call(`/issues/${activeIssueId}/return-request`, { method: 'POST', body: {} })).response.status, 401);
+    assert.equal((await call('/issues/not-an-object-id/return-request', { method: 'POST', token: studentToken, body: {} })).response.status, 400);
+    assert.equal((await call(`/issues/${activeIssueId}/return-request`, { method: 'POST', token: otherToken, body: {} })).response.status, 404);
+    assert.equal((await call('/return-requests', { token: studentToken })).response.status, 403);
+    assert.equal((await call(`/issues/${activeIssueId}/return-request/review`, { method: 'POST', token: studentToken, body: { action: 'approve' } })).response.status, 403);
+    assert.equal((await call(`/issues/${activeIssueId}/return-request/review`, { method: 'POST', token: adminToken, body: { action: 'complete' } })).response.status, 400);
+    const returnRequests = await Promise.all([1, 2].map(() => call(`/issues/${activeIssueId}/return-request`, { method: 'POST', token: studentToken, body: { studentId: otherStudent._id, userId: otherStudent.userId } })));
+    assert.deepEqual(returnRequests.map((result) => result.response.status).sort(), [201, 409]);
+    const pendingIssue = returnRequests.find((result) => result.response.status === 201).data.issue;
+    assert.equal(pendingIssue.student.toString?.() || pendingIssue.student._id, owner._id);
+    assert.equal(pendingIssue.returnRequestStatus, 'pending');
+    assert.equal((await Book.findById(book._id)).availableCopies, 0);
+    let pendingQueue = await call('/return-requests', { token: adminToken });
+    assert.equal(pendingQueue.response.status, 200);
+    assert.equal(pendingQueue.data.requests.length, 1);
+    assert.equal(pendingQueue.data.requests[0].student.userId, owner.userId);
+    assert.equal(pendingQueue.data.requests[0].student.department, owner.department);
+    assert.equal(pendingQueue.data.requests[0].student.studentNumber, owner.studentNumber);
+    assert.equal(JSON.stringify(pendingQueue.data).includes(owner.email), false);
+
+    const rejected = await call(`/issues/${activeIssueId}/return-request/review`, { method: 'POST', token: adminToken, body: { action: 'reject', reason: 'Please bring the book to the library desk.' } });
+    assert.equal(rejected.response.status, 200);
+    assert.equal(rejected.data.issue.returnRequestStatus, 'rejected');
+    assert.equal(rejected.data.issue.returnRequestReason, 'Please bring the book to the library desk.');
+    assert.equal(rejected.data.issue.status, 'issued');
+    assert.equal((await Book.findById(book._id)).availableCopies, 0);
+    assert.equal((await call('/issues', { token: studentToken })).data.issues[0].returnRequestReason, 'Please bring the book to the library desk.');
+
+    const resubmitted = await call(`/issues/${activeIssueId}/return-request`, { method: 'POST', token: studentToken, body: {} });
+    assert.equal(resubmitted.response.status, 201);
+    assert.equal(resubmitted.data.issue.returnRequestStatus, 'pending');
+    pendingQueue = await call('/return-requests', { token: adminToken });
+    assert.equal(pendingQueue.data.requests.length, 1);
+
+    const returned = await call(`/issues/${activeIssueId}/return-request/review`, { method: 'POST', token: adminToken, body: { action: 'approve' } });
     assert.equal(returned.response.status, 200);
+    assert.equal(returned.data.issue.status, 'returned');
+    assert.equal(returned.data.issue.returnRequestStatus, 'approved');
     assert.ok(returned.data.issue.returnedAt);
-    assert.ok(returned.data.issue.returnedBy);
+    assert.equal(String(returned.data.issue.returnedBy._id), String(admin._id));
+    assert.equal((await Book.findById(book._id)).availableCopies, 1);
+    assert.equal((await call(`/issues/${activeIssueId}/return-request/review`, { method: 'POST', token: adminToken, body: { action: 'approve' } })).response.status, 409);
+    assert.equal((await call(`/issues/${activeIssueId}/return-request`, { method: 'POST', token: studentToken, body: {} })).response.status, 409);
     assert.equal((await Book.findById(book._id)).availableCopies, 1);
     assert.equal((await call(`/issues/${activeIssueId}/return`, { method: 'POST', token: adminToken })).response.status, 409);
+
+    const secondBookLoan = async (user) => call('/issues', { method: 'POST', token: adminToken, body: { bookId: availabilityBook._id, userId: user.userId, dueDate } });
+    const firstLoan = await secondBookLoan(student);
+    assert.equal(firstLoan.response.status, 201);
+    let detail = await call(`/books/${availabilityBook._id}/availability`);
+    assert.deepEqual({ status: detail.data.book.availabilityStatus, total: detail.data.book.totalCopies, available: detail.data.book.availableCopies, issued: detail.data.book.issuedCopies }, { status: 'Available', total: 2, available: 1, issued: 1 });
+    let borrowers = await call(`/books/${availabilityBook._id}/borrowers`, { token: adminToken });
+    assert.equal(borrowers.response.status, 200);
+    assert.equal(borrowers.data.borrowers.length, 1);
+    assert.deepEqual(borrowers.data.borrowers[0].student, { name: student.name, userId: student.userId, semester: '3rd Semester', rollNumber: 'SCI-014', department: 'Science' });
+    assert.ok(borrowers.data.borrowers[0].issueDate);
+    assert.ok(borrowers.data.borrowers[0].dueDate);
+    assert.equal(JSON.stringify(borrowers.data).includes(student.email), false);
+
+    const secondLoan = await secondBookLoan(secondStudent);
+    assert.equal(secondLoan.response.status, 201);
+    detail = await call(`/books/${availabilityBook._id}/availability`);
+    assert.deepEqual({ status: detail.data.book.availabilityStatus, total: detail.data.book.totalCopies, available: detail.data.book.availableCopies, issued: detail.data.book.issuedCopies }, { status: 'Busy', total: 2, available: 0, issued: 2 });
+    borrowers = await call(`/books/${availabilityBook._id}/borrowers`, { token: adminToken });
+    assert.equal(borrowers.data.borrowers.length, 2);
+
+    const returnedLoan = await call(`/issues/${firstLoan.data.issue._id}/return`, { method: 'POST', token: adminToken });
+    assert.equal(returnedLoan.response.status, 200);
+    detail = await call(`/books/${availabilityBook._id}/availability`);
+    assert.deepEqual({ status: detail.data.book.availabilityStatus, available: detail.data.book.availableCopies, issued: detail.data.book.issuedCopies }, { status: 'Available', available: 1, issued: 1 });
+    borrowers = await call(`/books/${availabilityBook._id}/borrowers`, { token: adminToken });
+    assert.equal(borrowers.data.borrowers.length, 1);
+    assert.equal(borrowers.data.borrowers[0].student.userId, secondStudent.userId);
+    assert.equal((await call(`/books/${availabilityBook._id}/borrowers`, { token: adminToken })).data.borrowers.some(borrower => borrower.student.userId === student.userId), false);
+    const returnedSecondLoan = await call(`/issues/${secondLoan.data.issue._id}/return`, { method: 'POST', token: adminToken });
+    assert.equal(returnedSecondLoan.response.status, 200);
+    assert.equal((await call(`/books/${availabilityBook._id}/availability`)).data.book.availableCopies, 2);
+  });
+
+  await t.test('student self-service uses JWT identity and protects copy counts', async () => {
+    const studentToken = (await login(student.userId, 'StudentOne123!')).data.token;
+    assert.equal((await call('/issues', { method: 'POST', body: { bookId: selfServiceBook._id, selfService: true } })).response.status, 401);
+    assert.equal((await call('/issues', { method: 'POST', token: adminToken, body: { bookId: selfServiceBook._id, selfService: true } })).response.status, 403);
+
+    const requests = [1, 2].map(() => call('/issues', { method: 'POST', token: studentToken, body: { bookId: selfServiceBook._id, selfService: true, userId: secondStudent.userId, dueDate: '2000-01-01' } }));
+    const results = await Promise.all(requests);
+    assert.deepEqual(results.map((result) => result.response.status).sort(), [201, 409]);
+    const successfulBorrow = results.find((result) => result.response.status === 201);
+    assert.equal(successfulBorrow.data.issue.student._id, student._id);
+    assert.ok(successfulBorrow.data.issue.issueDate);
+    const loanDays = (new Date(successfulBorrow.data.issue.dueDate).getTime() - new Date(successfulBorrow.data.issue.issueDate).getTime()) / 86400000;
+    assert.ok(loanDays >= 13.99 && loanDays <= 14.01);
+    assert.equal((await Book.findById(selfServiceBook._id)).availableCopies, 1);
+    assert.equal(await BookIssue.countDocuments({ book: selfServiceBook._id, status: 'issued' }), 1);
+
+    const secondStudentToken = (await login(secondStudent.userId, 'StudentTwo123!')).data.token;
+    const lastCopy = await call('/issues', { method: 'POST', token: secondStudentToken, body: { bookId: selfServiceBook._id, selfService: true } });
+    assert.equal(lastCopy.response.status, 201);
+    assert.equal((await Book.findById(selfServiceBook._id)).availableCopies, 0);
+    assert.equal((await call('/issues', { method: 'POST', token: studentToken, body: { bookId: selfServiceBook._id, selfService: true } })).response.status, 409);
+    assert.equal(await BookIssue.countDocuments({ book: selfServiceBook._id, status: 'issued' }), 2);
+
+    const ownIssues = await call('/issues?status=issued', { token: studentToken });
+    const ownIssue = ownIssues.data.issues.find((issue) => issue.book._id === selfServiceBook._id);
+    assert.ok(ownIssue);
+    assert.equal(ownIssue.student._id, student._id);
+    assert.ok(ownIssue.issueDate);
+    assert.ok(ownIssue.dueDate);
+
+    for (const issue of [successfulBorrow.data.issue, lastCopy.data.issue]) {
+      assert.equal((await call(`/issues/${issue._id}/return`, { method: 'POST', token: adminToken })).response.status, 200);
+    }
+    assert.equal((await Book.findById(selfServiceBook._id)).availableCopies, 2);
   });
 
   await t.test('admin/student dashboards and student profile isolation', async () => {
     const adminDashboard = await call('/dashboard', { token: adminToken });
     assert.equal(adminDashboard.response.status, 200);
     assert.equal(adminDashboard.data.stats.students, 2);
-    assert.equal(adminDashboard.data.stats.bookTitles, 1);
-    assert.equal(adminDashboard.data.stats.availableBooks, 1);
-    assert.equal(adminDashboard.data.recentIssues.length, 1);
+    assert.equal(adminDashboard.data.stats.bookTitles, 3);
+    assert.equal(adminDashboard.data.stats.availableBooks, 5);
+    assert.equal(adminDashboard.data.recentIssues.length, 5);
     assert.equal(adminDashboard.data.recentStudents.length, 2);
-    assert.equal(adminDashboard.data.stats.returned, 1);
+    assert.equal(adminDashboard.data.stats.returned, 5);
     const studentToken = (await login(student.email, 'StudentOne123!')).data.token;
     const studentDashboard = await call('/dashboard', { token: studentToken });
     assert.equal(studentDashboard.response.status, 200);
-    assert.equal(studentDashboard.data.stats.available, 1);
+    assert.equal(studentDashboard.data.issues.find((issue) => issue._id === activeIssueId).returnRequestStatus, 'approved');
+    assert.equal(studentDashboard.data.stats.available, 3);
     assert.equal(studentDashboard.data.stats.issued, 0);
     assert.equal(studentDashboard.data.stats.overdue, 0);
-    assert.equal(studentDashboard.data.stats.returned, issuedStudent.userId === student.userId ? 1 : 0);
-    assert.equal(studentDashboard.data.recentIssues.length, 1);
+    assert.equal(studentDashboard.data.stats.returned, (issuedStudent.userId === student.userId ? 1 : 0) + 2);
+    assert.equal(studentDashboard.data.recentIssues.length, (issuedStudent.userId === student.userId ? 2 : 1) + 1);
     assert.ok(Array.isArray(studentDashboard.data.recommendedBooks));
     const profile = await call('/users/me', { method: 'PATCH', token: studentToken, body: { name: 'Student One Updated', department: 'Arts' } });
     assert.equal(profile.response.status, 200);
     assert.equal(profile.data.user.name, 'Student One Updated');
     assert.equal(profile.data.user.department, 'Arts');
+    const studentWithSemester = await call('/users/me', { method: 'PATCH', token: studentToken, body: { semester: '4th Semester', studentNumber: 'SCI-015' } });
+    assert.equal(studentWithSemester.data.user.semester, '4th Semester');
+    assert.equal(studentWithSemester.data.user.studentNumber, 'SCI-015');
     assert.equal((await call(`/users/${student.userId}`, { token: studentToken })).response.status, 403);
   });
 
@@ -333,6 +482,7 @@ test('isolated MongoDB API integration workflows', async (t) => {
     assert.equal((await call(`/categories/${category._id}`, { method: 'DELETE', token: adminToken })).response.status, 409);
     assert.equal((await call(`/authors/${author._id}`, { method: 'DELETE', token: adminToken })).response.status, 409);
     assert.equal((await call(`/books/${book._id}`, { method: 'DELETE', token: adminToken })).response.status, 200);
+    assert.equal((await call(`/books/${availabilityBook._id}`, { method: 'DELETE', token: adminToken })).response.status, 200);
     assert.equal((await call(`/categories/${category._id}`, { method: 'DELETE', token: adminToken })).response.status, 200);
     assert.equal((await call(`/authors/${author._id}`, { method: 'DELETE', token: adminToken })).response.status, 200);
   });
