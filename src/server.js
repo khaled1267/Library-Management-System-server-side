@@ -17,12 +17,17 @@ dotenv.config({ path: fileURLToPath(new URL('../.env', import.meta.url)) });
 const app = express();
 app.use(helmet());
 const configuredClientOrigins = (process.env.CLIENT_URL?.split(',') || []).map(origin => origin.trim()).filter(Boolean);
-if (process.env.NODE_ENV === 'production' && (!configuredClientOrigins.length || configuredClientOrigins.some(origin => {
-  try { const parsed = new URL(origin); return parsed.protocol !== 'https:' || parsed.origin !== origin; } catch { return true; }
-}))) {
-  throw new Error('Set CLIENT_URL to one or more exact HTTPS frontend origins in production.');
-}
 const allowedClientOrigins = new Set(configuredClientOrigins.length ? configuredClientOrigins : ['http://localhost:3000']);
+const invalidClientOrigin = [...allowedClientOrigins].some(origin => {
+  try {
+    const parsed = new URL(origin);
+    return !['http:', 'https:'].includes(parsed.protocol) || parsed.origin !== origin || origin === '*'
+      || (process.env.NODE_ENV === 'production' && parsed.protocol !== 'https:' && origin !== 'http://localhost:3000');
+  } catch { return true; }
+});
+if (invalidClientOrigin || (process.env.NODE_ENV === 'production' && !configuredClientOrigins.length)) {
+  throw new Error('Set CLIENT_URL to exact frontend origins; production origins must use HTTPS except http://localhost:3000.');
+}
 app.use(cors({ origin: [...allowedClientOrigins], credentials: true }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
