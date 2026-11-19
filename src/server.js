@@ -29,6 +29,14 @@ if (invalidClientOrigin || (process.env.NODE_ENV === 'production' && !configured
   throw new Error('Set CLIENT_URL to exact frontend origins; production origins must use HTTPS except http://localhost:3000.');
 }
 app.use(cors({ origin: [...allowedClientOrigins], credentials: true }));
+app.use('/api/auth', (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  if (req.method === 'GET' || req.method === 'HEAD') {
+    delete req.headers['if-none-match'];
+    delete req.headers['if-modified-since'];
+  }
+  next();
+});
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 app.use((req, res, next) => {
