@@ -44,9 +44,12 @@ const safeUser = (u) => ({ _id: u._id, userId: u.userId, name: u.name, email: u.
 const tokenFor = (u) => jwt.sign({ sub: u._id.toString(), role: u.role }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d', algorithm: 'HS256' });
 const sessionCookieName = 'library_session';
 const sessionCookieOptions = () => {
+  const isProduction = process.env.NODE_ENV === 'production' || process.env.VERCEL_ENV === 'production';
   const configuredSameSite = process.env.SESSION_COOKIE_SAME_SITE?.toLowerCase();
-  const sameSite = ['strict', 'lax', 'none'].includes(configuredSameSite) ? configuredSameSite : 'lax';
-  return { httpOnly: true, secure: process.env.NODE_ENV === 'production' || sameSite === 'none', sameSite, path: '/' };
+  const sameSite = isProduction
+    ? 'none'
+    : ['strict', 'lax', 'none'].includes(configuredSameSite) ? configuredSameSite : 'lax';
+  return { httpOnly: true, secure: isProduction || sameSite === 'none', sameSite, path: '/' };
 };
 const cookieToken = (req) => {
   const entry = req.headers.cookie?.split(';').map(part => part.trim()).find(part => part.startsWith(`${sessionCookieName}=`));
